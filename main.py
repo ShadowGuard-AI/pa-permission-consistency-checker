@@ -122,6 +122,10 @@ def get_file_mode(file_path):
         return None
 
 
+# This is a mode bits test, not a real access test. I do not look at
+# ACLs, and I do not check execute permission on the directories above
+# the file, so a file can pass here and still be unreachable for that
+# user once the parent directory blocks the walk down to it.
 def _user_can_read(file_path, user):
     """Mode based read test for a named user, by relation to the file."""
     try:
@@ -168,6 +172,9 @@ def check_file_permissions(file_path, user=None, expected_mode=None):
             logging.error(f"File not found: {file_path}")
             return False
 
+        # Read is the only access I ever test. Write and execute are
+        # never checked for any user, so an OK row means readable and,
+        # when a mode was given, matching that mode. Nothing more.
         # Check read access. When a user is named, the test is mode based:
         # it uses the owner bits when that user owns the file, the group
         # bits when the file group is one of that user's groups, and the
@@ -267,6 +274,9 @@ def main():
             expected_mode = int(args.expected_mode, 8)
             # Applying a bitwise AND operation with DEFAULT_FILE_MODE_MASK 
             # ensures that the provided mode respects existing system restrictions.
+            # The mask quietly strips setuid, setgid, and sticky bits.
+            # Asking for 4755 checks and fixes against 755 instead, with
+            # no warning that the special bits were dropped.
             expected_mode &= DEFAULT_FILE_MODE_MASK
             logging.debug(f"Parsed expected mode: {oct(expected_mode)}")
         except ValueError:
@@ -318,6 +328,9 @@ def main():
         if has_access:
             status = "OK"
         else:
+            # A successful chmod is counted as fixed without a recheck.
+            # If the mode now matches but the named user still cannot
+            # read the file, the row says Fixed and the run exits 0.
             if args.fix_permissions and expected_mode is not None and fix_file_permissions(entry_path, expected_mode):
                 status = "Fixed"
                 fixed_count += 1
