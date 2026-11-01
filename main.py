@@ -5,6 +5,9 @@ import logging
 import os
 import sys
 import stat
+import grp
+import pwd
+
 import pathspec  # Used for filtering files based on patterns
 
 from rich.console import Console
@@ -80,7 +83,15 @@ def setup_argparse():
     parser.add_argument(
         "--recursive",
         action="store_true",
+        default=True,
         help="Check permissions recursively.  Enabled by default if path is a directory.",
+    )
+
+    parser.add_argument(
+        "--no-recursive",
+        dest="recursive",
+        action="store_false",
+        help="Do not check permissions recursively. Only the named directory, its immediate entries, and its immediate subdirectories are checked.",
     )
     
     parser.add_argument(
@@ -111,6 +122,31 @@ def get_file_mode(file_path):
         return None
 
 
+def _user_can_read(file_path, user):
+    """Mode based read test for a named user, by relation to the file."""
+    try:
+        entry = pwd.getpwnam(user)
+    except KeyError:
+        return False
+    try:
+        st = os.stat(file_path)
+    except OSError:
+        return False
+    mode = stat.S_IMODE(st.st_mode)
+    try:
+        group_ids = os.getgrouplist(user, entry.pw_gid)
+    except Exception:
+        group_ids = [entry.pw_gid]
+        for group in grp.getgrall():
+            if user in group.gr_mem:
+                group_ids.append(group.gr_gid)
+    if st.st_uid == entry.pw_uid:
+        return bool(mode & 0o400)
+    if st.st_gid in group_ids:
+        return bool(mode & 0o040)
+    return bool(mode & 0o004)
+
+
 def check_file_permissions(file_path, user=None, expected_mode=None):
     """
     Checks if a user has access to a file and if the file has the expected permissions.
@@ -125,7 +161,6 @@ def check_file_permissions(file_path, user=None, expected_mode=None):
     """
 
     try:
-        # Security check: Use os.path.abspath to resolve symlinks and prevent path traversal vulnerabilities.
         file_path = os.path.abspath(file_path)
 
         # Check file existence
@@ -133,13 +168,14 @@ def check_file_permissions(file_path, user=None, expected_mode=None):
             logging.error(f"File not found: {file_path}")
             return False
 
-        # Check file permissions for the specified user or current user
+        # Check read access. When a user is named, the test is mode based:
+        # it uses the owner bits when that user owns the file, the group
+        # bits when the file group is one of that user's groups, and the
+        # other bits otherwise. Without a named user, os.access for the
+        # current process is used.
         if user:
-            # Not implemented for Linux without external tools (e.g., `sudo -u <user> test -rwx <file>`).
-            logging.warning("User-specific permission checks are not fully supported on Linux without external tools.")
-            # For demo purposes only: naive check based on current user's permissions
-            if not os.access(file_path, os.R_OK):
-                logging.warning(f"Current user does not have read access to {file_path}")
+            if not _user_can_read(file_path, user):
+                logging.warning(f"User {user} does not have read access to {file_path} by its mode bits")
                 return False
         else:
             if not os.access(file_path, os.R_OK):
@@ -178,7 +214,6 @@ def fix_file_permissions(file_path, expected_mode):
         bool: True if the permissions were successfully fixed, False otherwise.
     """
     try:
-        # Security check: Use os.path.abspath to resolve symlinks and prevent path traversal vulnerabilities.
         file_path = os.path.abspath(file_path)
 
         os.chmod(file_path, expected_mode)
@@ -239,6 +274,19 @@ def main():
             sys.exit(ERROR_INVALID_ARGUMENT)
 
 
+    if args.fix_permissions and expected_mode is None:
+        print("Fixing requires an expected mode: use --expected-mode.")
+        logging.error("Fixing requires an expected mode: use --expected-mode.")
+        sys.exit(ERROR_INVALID_ARGUMENT)
+
+    if args.user:
+        try:
+            pwd.getpwnam(args.user)
+        except KeyError:
+            print(f"User not found: {args.user}")
+            logging.error(f"User not found: {args.user}")
+            sys.exit(ERROR_USER_NOT_FOUND)
+
     # Load exclude patterns if an exclude file is provided.
     exclude_spec = None
     if args.exclude_file:
@@ -254,82 +302,88 @@ def main():
     table.add_column("Actual Mode", style="yellow")
 
     inconsistent_count = 0
+    fixed_count = 0
     total_files = 0
 
-    if os.path.isfile(args.path):
-        # If a single file is provided as the path
-        total_files = 1
-        if exclude_spec and exclude_spec.match_file(args.path):
-            logging.info(f"Skipping excluded file: {args.path}")
-            status = "Excluded"
-            expected_mode_str = "N/A"
-            actual_mode_str = "N/A"
+    def process_entry(entry_path):
+        nonlocal inconsistent_count, fixed_count, total_files
+        if exclude_spec and exclude_spec.match_file(entry_path):
+            logging.info(f"Skipping excluded file: {entry_path}")
+            return
+        total_files += 1
+        has_access = check_file_permissions(entry_path, args.user, expected_mode)
+        actual_mode = get_file_mode(entry_path)
+        expected_mode_str = oct(expected_mode) if expected_mode else "Any"
+        actual_mode_str = oct(actual_mode) if actual_mode is not None else "N/A"
+        if has_access:
+            status = "OK"
         else:
-            has_access = check_file_permissions(args.path, args.user, expected_mode)
-            actual_mode = get_file_mode(args.path)
-
-            if has_access:
-                status = "OK"
-                expected_mode_str = oct(expected_mode) if expected_mode else "Any"
-                actual_mode_str = oct(actual_mode) if actual_mode else "N/A"
-
+            if args.fix_permissions and expected_mode is not None and fix_file_permissions(entry_path, expected_mode):
+                status = "Fixed"
+                fixed_count += 1
             else:
                 status = "Inconsistent"
                 inconsistent_count += 1
-                expected_mode_str = oct(expected_mode) if expected_mode else "Any"
-                actual_mode_str = oct(actual_mode) if actual_mode else "N/A"
-                if args.fix_permissions and expected_mode:
-                    if fix_file_permissions(args.path, expected_mode):
-                        status = "Fixed"
-
         if args.report_inconsistencies or status != "OK":
-           table.add_row(args.path, status, expected_mode_str, actual_mode_str)
+            table.add_row(entry_path, status, expected_mode_str, actual_mode_str)
 
-    else: # Directory
-        # Walk the directory tree and check permissions recursively
-        for root, _, files in os.walk(args.path):
-            for file in files:
-                file_path = os.path.join(root, file)
-                total_files += 1
-
-                # Exclude files based on patterns, if specified
-                if exclude_spec and exclude_spec.match_file(file_path):
-                    logging.info(f"Skipping excluded file: {file_path}")
-                    status = "Excluded"
-                    expected_mode_str = "N/A"
-                    actual_mode_str = "N/A"
-                else:
-                    has_access = check_file_permissions(file_path, args.user, expected_mode)
-                    actual_mode = get_file_mode(file_path)
-
-                    if has_access:
-                        status = "OK"
-                        expected_mode_str = oct(expected_mode) if expected_mode else "Any"
-                        actual_mode_str = oct(actual_mode) if actual_mode else "N/A"
+    if os.path.islink(args.path):
+        logging.info(f"Skipping symlink: {args.path}")
+        print(f"Skipping symlink: {args.path}")
+    elif os.path.isfile(args.path):
+        process_entry(args.path)
+    else:
+        # Walk the directory tree. The walk is recursive by default.
+        # Each directory, including the root, is checked as its own row.
+        # Symlinks are skipped entirely, in check and fix modes alike.
+        to_check = []
+        def collect(dir_path, depth):
+            to_check.append(dir_path)
+            try:
+                entries = sorted(os.listdir(dir_path))
+            except OSError as e:
+                logging.error(f"Error reading directory {dir_path}: {e}")
+                return
+            for name in entries:
+                entry_path = os.path.join(dir_path, name)
+                if os.path.islink(entry_path):
+                    logging.info(f"Skipping symlink: {entry_path}")
+                    print(f"Skipping symlink: {entry_path}")
+                    continue
+                if os.path.isdir(entry_path):
+                    if args.recursive:
+                        collect(entry_path, depth + 1)
                     else:
-                        status = "Inconsistent"
-                        inconsistent_count += 1
-                        expected_mode_str = oct(expected_mode) if expected_mode else "Any"
-                        actual_mode_str = oct(actual_mode) if actual_mode else "N/A"
-                        if args.fix_permissions and expected_mode:
-                            if fix_file_permissions(file_path, expected_mode):
-                                status = "Fixed"
-
-                if args.report_inconsistencies or status != "OK":
-                    table.add_row(file_path, status, expected_mode_str, actual_mode_str)
-            if not args.recursive:
-                break
+                        if depth == 0:
+                            to_check.append(entry_path)
+                elif os.path.isfile(entry_path):
+                    if args.recursive or depth == 0:
+                        to_check.append(entry_path)
+        # An empty directory, with no entries at all, is a run that
+        # checked nothing for the no files checked rule in decision 5.
+        try:
+            _root_entries = os.listdir(args.path)
+        except OSError:
+            _root_entries = ["x"]
+        if _root_entries:
+            collect(args.path, 0)
+        for entry_path in to_check:
+            process_entry(entry_path)
 
     if args.report_inconsistencies:
         console.print(table)
-    else:
-        console.print(f"Total files checked: {total_files}")
-        console.print(f"Files with inconsistent permissions: {inconsistent_count}")
+    console.print(f"Total files checked: {total_files}")
+    console.print(f"Files with inconsistent permissions: {inconsistent_count}")
+    console.print(f"Files fixed: {fixed_count}")
+
+    if total_files == 0:
+        print("No files checked.")
+        sys.exit(1)
 
     if inconsistent_count > 0:
         sys.exit(ERROR_INCONSISTENT_PERMISSIONS)
     else:
-        sys.exit(0)  # Success
+        sys.exit(0)  # Success, including when every inconsistency was fixed
 
 
 if __name__ == "__main__":
